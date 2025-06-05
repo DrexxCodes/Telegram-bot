@@ -26,10 +26,37 @@ const db = admin.firestore();
 // === Telegram Setup ===
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
-const knownCommands = ['/start', '/viewTicket', '/help', '/profile', '/credits', '/fund'];
+const knownCommands = ['/start', '/viewTicket', '/help', '/profile', '/credits', '/fund', '/disconnect'];
 const userStates = {}; // For tracking fund input stage
-const pendingConnections = {}; // For tracking pending bot connections
-// const serverStartTime = Date.now(); // Track server start time for uptime monitoring
+const serverStartTime = Date.now(); // Track server start time for uptime monitoring
+
+// === Helper Functions ===
+async function findUserByChatId(chatId) {
+  try {
+    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
+    if (userSnap.empty) return null;
+    return {
+      id: userSnap.docs[0].id,
+      data: userSnap.docs[0].data()
+    };
+  } catch (error) {
+    console.error('Error finding user by chat ID:', error);
+    return null;
+  }
+}
+
+async function sendAuthRequiredMessage(chatId) {
+  await sendMessage(chatId, '🔐 *Authentication Required*\n\nTo use this feature, you need to connect your Telegram account to your Spotix profile first.\n\n👆 Click the button below to go to your profile page and connect your account.', {
+    inline_keyboard: [
+      [
+        { text: '🔗 Connect Account', url: 'https://spotix.com.ng/profile' }
+      ],
+      [
+        { text: '❓ Help', callback_data: 'show_commands' }
+      ]
+    ]
+  });
+}
 
 // === Webhook Handler ===
 fastify.post('/webhook', async (request, reply) => {
@@ -46,38 +73,45 @@ fastify.post('/webhook', async (request, reply) => {
   if (text?.startsWith('/start')) {
     const parts = text.split(' ');
     
+    // First check if user is already connected
+    const existingUser = await findUserByChatId(chatId);
+    
     if (parts.length > 1) {
       // Connection token provided
       const connectionToken = parts[1];
+      
+      if (existingUser) {
+        await sendMessage(chatId, `👋 Welcome back, ${existingUser.data.fullName || 'User'}!\n\nYour Telegram account is already connected to your Spotix profile.\n\nUse /help to see available commands.`);
+        return reply.send({ status: 'ok' });
+      }
       
       // Check if this is a valid connection token
       try {
         const tokenDoc = await db.collection('telegramTokens').doc(connectionToken).get();
         
-        // Fixed: Use .exists property instead of .exists() function
         if (tokenDoc.exists) {
           const tokenData = tokenDoc.data();
-          const userId = tokenData.uid; // Changed from userId to uid to match your token structure
+          const userId = tokenData.uid;
           
           // Check if token is still valid (not expired)
           const now = new Date();
           const expiresAt = tokenData.expiresAt.toDate();
           
           if (expiresAt < now) {
-            await sendMessage(chatId, '❌ Connection token has expired. Please try connecting again from your Spotix profile.');
+            await sendMessage(chatId, '❌ Connection token has expired. Please generate a new one from your Spotix profile.\n\n🔗 Go to: https://spotix.com.ng/profile');
             return reply.send({ status: 'ok' });
           }
           
           // Check if token hasn't been used
           if (tokenData.used) {
-            await sendMessage(chatId, '❌ This connection token has already been used. Please generate a new one from your Spotix profile.');
+            await sendMessage(chatId, '❌ This connection token has already been used. Please generate a new one from your Spotix profile.\n\n🔗 Go to: https://spotix.com.ng/profile');
             return reply.send({ status: 'ok' });
           }
           
           // Get user details from users collection
           const userDoc = await db.collection('users').doc(userId).get();
           if (!userDoc.exists) {
-            await sendMessage(chatId, '❌ User account not found. Please try again.');
+            await sendMessage(chatId, '❌ User account not found. Please try again.\n\n🔗 Go to: https://spotix.com.ng/profile');
             return reply.send({ status: 'ok' });
           }
           
@@ -95,52 +129,79 @@ fastify.post('/webhook', async (request, reply) => {
           
           return reply.send({ status: 'ok' });
         } else {
-          await sendMessage(chatId, '❌ Invalid connection token. Please generate a new one from your Spotix profile.');
+          await sendMessage(chatId, '❌ Invalid connection token. Please generate a new one from your Spotix profile.\n\n🔗 Go to: https://spotix.com.ng/profile');
         }
       } catch (error) {
         console.error('Error checking connection token:', error);
-        await sendMessage(chatId, '❌ Error processing connection. Please try again.');
+        await sendMessage(chatId, '❌ Error processing connection. Please try again.\n\n🔗 Go to: https://spotix.com.ng/profile');
+      }
+    } else {
+      // Regular start command - check if already connected
+      if (existingUser) {
+        await sendMessage(chatId, `👋 Welcome back, ${existingUser.data.fullName || 'User'}!\n\nYour Telegram account is already connected to your Spotix profile.\n\nUse /help to see available commands.`, {
+          inline_keyboard: [
+            [
+              { text: '📘 Show Commands', callback_data: 'show_commands' },
+              { text: '👤 Profile', callback_data: 'show_profile' }
+            ]
+          ]
+        });
+      } else {
+        // Not connected - show welcome and connection instructions
+        await sendMessage(chatId, '🎉 *Welcome to Spotix Bot!*\n\nTo access your account features, you need to connect your Telegram account through your Spotix profile page.\n\n🔗 Visit your profile page and click "Connect Telegram Bot" to get started.', {
+          inline_keyboard: [
+            [
+              { text: '🔗 Go to Profile Page', url: 'https://spotix.com.ng/profile' }
+            ],
+            [
+              { text: '📘 Show Commands', callback_data: 'show_commands' }
+            ]
+          ]
+        });
       }
     }
-    
-    // Regular start command
-    await sendMessage(chatId, 'Welcome to Spotix Bot! 🎉\n\nTo access your account features, please connect your Telegram account through your Spotix profile page.');
-    await sendMessage(chatId, 'Available commands:', {
-      inline_keyboard: [[{ text: 'Show Commands', callback_data: 'show_commands' }]]
-    });
   }
 
   else if (text === '/viewTicket') {
+    const user = await findUserByChatId(chatId);
+    
+    if (!user) {
+      await sendAuthRequiredMessage(chatId);
+      return reply.send({ status: 'ok' });
+    }
+
     await sendMessage(chatId, '⏳ Just a moment...');
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
+    
+    try {
+      const ticketsSnap = await db.collection(`TicketHistory/${user.id}/tickets`).get();
 
-    if (userSnap.empty) {
-      await sendMessage(chatId, '❌ Your Telegram account is not connected to Spotix. Please connect through your profile page first.');
-      return reply.send({ status: 'ok' });
-    }
+      if (ticketsSnap.empty) {
+        await sendMessage(chatId, '🎟 You have no tickets yet.\n\nVisit Spotix to book your first event!', {
+          inline_keyboard: [
+            [{ text: '🎫 Browse Events', url: 'https://spotix.com.ng' }]
+          ]
+        });
+        return reply.send({ status: 'ok' });
+      }
 
-    const userId = userSnap.docs[0].id;
-    const ticketsSnap = await db.collection(`TicketHistory/${userId}/tickets`).get();
+      for (const doc of ticketsSnap.docs) {
+        const ticket = doc.data();
+        const ticketId = ticket.ticketId || 'Unavailable';
 
-    if (ticketsSnap.empty) {
-      await sendMessage(chatId, '🎟 You have no tickets yet.');
-      return reply.send({ status: 'ok' });
-    }
-
-    for (const doc of ticketsSnap.docs) {
-      const ticket = doc.data();
-      const ticketId = ticket.ticketId || 'Unavailable';
-
-      const ticketText = `🎟 *Event:* ${ticket.eventName}
+        const ticketText = `🎟 *Event:* ${ticket.eventName}
 📅 *Date:* ${ticket.eventDate}
 📍 *Venue:* ${ticket.eventVenue}
 🎫 *Type:* ${ticket.ticketType}
 ✅ *Verified:* ${ticket.verified ? 'Yes' : 'No'}
 ||🆔 Ticket ID: ${ticketId}||`;
 
-      await sendMessage(chatId, ticketText, {
-        inline_keyboard: [[{ text: 'Get QR', callback_data: `qr_${ticketId}` }]]
-      });
+        await sendMessage(chatId, ticketText, {
+          inline_keyboard: [[{ text: 'Get QR Code', callback_data: `qr_${ticketId}` }]]
+        });
+      }
+    } catch (error) {
+      console.error('Error fetching tickets:', error);
+      await sendMessage(chatId, '❌ Error fetching your tickets. Please try again later.');
     }
   }
 
@@ -152,28 +213,43 @@ fastify.post('/webhook', async (request, reply) => {
       '`/profile` - View your user profile\n' +
       '`/credits` - View credits and project info\n' +
       '`/fund` - Fund your wallet\n' +
+      '`/disconnect` - Disconnect your Telegram account\n' +
       '`/help` - Show this help message\n\n' +
       '💡 *Note:* Connect your account through your Spotix profile to access all features!\n\n' +
-      'Thank you for choosing *Spotix*! 💜');
+      'Thank you for choosing *Spotix*! 💜', {
+      inline_keyboard: [
+        [{ text: '🔗 Connect Account', url: 'https://spotix.com.ng/profile' }]
+      ]
+    });
   }
 
-  else if (text === '/profile') {
-    await sendMessage(chatId, '🔍 Just a moment...');
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
+  else if (text === '/profile' || callbackQuery?.data === 'show_profile') {
+    const cbChatId = callbackQuery?.message?.chat?.id || chatId;
+    const user = await findUserByChatId(cbChatId);
+    
+    if (!user) {
+      await sendAuthRequiredMessage(cbChatId);
+      return reply.send({ status: 'ok' });
+    }
 
-    if (userSnap.empty) {
-      await sendMessage(chatId, '⚠️ Your Telegram account is not connected to Spotix. Please connect through your profile page first.');
-    } else {
-      const user = userSnap.docs[0].data();
-      const profileText = `👤 *Profile Details:*
-🧑 Full Name: ${user.fullName || 'N/A'}
-📧 Email: ${user.email || 'N/A'}
-💬 Telegram: @${user.telegramUsername || 'N/A'}
-||🆔 UID: ${userSnap.docs[0].id}||
+    await sendMessage(cbChatId, '🔍 Just a moment...');
+    
+    const profileText = `👤 *Profile Details:*
+🧑 Full Name: ${user.data.fullName || 'N/A'}
+📧 Email: ${user.data.email || 'N/A'}
+💬 Telegram: @${user.data.telegramUsername || 'N/A'}
+||🆔 UID: ${user.id}||
 
 Thank you for choosing *Spotix*! 💜`;
-      await sendMessage(chatId, profileText);
-    }
+    
+    await sendMessage(cbChatId, profileText, {
+      inline_keyboard: [
+        [
+          { text: '🌐 View Full Profile', url: 'https://spotix.com.ng/profile' },
+          { text: '🔌 Disconnect', callback_data: 'confirm_disconnect' }
+        ]
+      ]
+    });
   }
 
   else if (text === '/credits') {
@@ -187,10 +263,10 @@ Thank you for choosing *Spotix*! 💜`);
   }
 
   else if (text === '/fund') {
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
+    const user = await findUserByChatId(chatId);
     
-    if (userSnap.empty) {
-      await sendMessage(chatId, '⚠️ Your Telegram account is not connected to Spotix. Please connect through your profile page first.');
+    if (!user) {
+      await sendAuthRequiredMessage(chatId);
       return reply.send({ status: 'ok' });
     }
     
@@ -198,7 +274,33 @@ Thank you for choosing *Spotix*! 💜`);
     userStates[chatId] = { awaitingFundAmount: true };
   }
 
+  else if (text === '/disconnect') {
+    const user = await findUserByChatId(chatId);
+    
+    if (!user) {
+      await sendMessage(chatId, '❌ Your Telegram account is not connected to any Spotix profile.');
+      return reply.send({ status: 'ok' });
+    }
+    
+    await sendMessage(chatId, `🔌 *Disconnect Telegram Account*\n\nAre you sure you want to disconnect your Telegram account from your Spotix profile?\n\n⚠️ You will lose access to all bot features until you reconnect.`, {
+      inline_keyboard: [
+        [
+          { text: '✅ Yes, Disconnect', callback_data: 'confirm_disconnect' },
+          { text: '❌ Cancel', callback_data: 'cancel_disconnect' }
+        ]
+      ]
+    });
+  }
+
   else if (userStates[chatId]?.awaitingFundAmount) {
+    const user = await findUserByChatId(chatId);
+    
+    if (!user) {
+      delete userStates[chatId];
+      await sendAuthRequiredMessage(chatId);
+      return reply.send({ status: 'ok' });
+    }
+
     const amount = parseInt(text.trim());
 
     if (isNaN(amount) || amount <= 0) {
@@ -208,21 +310,18 @@ Thank you for choosing *Spotix*! 💜`);
 
     delete userStates[chatId];
 
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
-    if (userSnap.empty) {
-      await sendMessage(chatId, '⚠️ Cannot find your account. Please connect your Telegram first.');
-      return reply.send({ status: 'ok' });
-    }
-
-    const email = userSnap.docs[0].data().email;
-
     await sendMessage(chatId, '🔎 Generating your payment link...');
 
-    const paymentLink = await generatePaymentLink(email, amount, chatId);
-    if (!paymentLink) {
+    try {
+      const paymentLink = await generatePaymentLink(user.data.email, amount, chatId);
+      if (!paymentLink) {
+        await sendMessage(chatId, '❌ Failed to create payment link. Try again later.');
+      } else {
+        await sendMessage(chatId, `✅ Please complete your payment:\n\n${paymentLink}`);
+      }
+    } catch (error) {
+      console.error('Error generating payment link:', error);
       await sendMessage(chatId, '❌ Failed to create payment link. Try again later.');
-    } else {
-      await sendMessage(chatId, `✅ Please complete your payment:\n\n${paymentLink}`);
     }
   }
 
@@ -241,7 +340,6 @@ Thank you for choosing *Spotix*! 💜`);
       try {
         const tokenDoc = await db.collection('telegramTokens').doc(connectionToken).get();
         
-        // Fixed: Use .exists property instead of .exists() function
         if (tokenDoc.exists) {
           const tokenData = tokenDoc.data();
           const userId = tokenData.uid;
@@ -251,7 +349,7 @@ Thank you for choosing *Spotix*! 💜`);
           const expiresAt = tokenData.expiresAt.toDate();
           
           if (expiresAt < now) {
-            await sendMessage(cbChatId, '❌ Connection token has expired. Please try again.');
+            await sendMessage(cbChatId, '❌ Connection token has expired. Please try again.\n\n🔗 Go to: https://spotix.com.ng/profile');
             return reply.send({ status: 'ok' });
           }
           
@@ -281,7 +379,14 @@ Thank you for choosing *Spotix*! 💜`);
             telegramLastName: lastName || ''
           });
           
-          await sendMessage(cbChatId, `🎉 *Connection Successful!*\n\nYour Telegram account (@${username || 'unknown'}) has been successfully connected to your Spotix profile.\n\n✅ **Connected Details:**\n👤 Name: ${firstName || ''} ${lastName || ''}\n💬 Username: @${username || 'Not set'}\n🆔 Chat ID: ${cbChatId}\n\nYou can now use all bot features! Try \`/profile\` to see your connected account details.`);
+          await sendMessage(cbChatId, `🎉 *Connection Successful!*\n\nYour Telegram account (@${username || 'unknown'}) has been successfully connected to your Spotix profile.\n\n✅ **Connected Details:**\n👤 Name: ${firstName || ''} ${lastName || ''}\n💬 Username: @${username || 'Not set'}\n🆔 Chat ID: ${cbChatId}\n\nYou can now use all bot features! Try \`/profile\` to see your connected account details.`, {
+            inline_keyboard: [
+              [
+                { text: '👤 View Profile', callback_data: 'show_profile' },
+                { text: '📘 Show Commands', callback_data: 'show_commands' }
+              ]
+            ]
+          });
           
           console.log(`✅ Telegram account connected for user ${userId}:`, {
             telegramChatId: cbChatId,
@@ -290,19 +395,62 @@ Thank you for choosing *Spotix*! 💜`);
             telegramLastName: lastName
           });
         } else {
-          await sendMessage(cbChatId, '❌ Invalid or expired connection token.');
+          await sendMessage(cbChatId, '❌ Invalid or expired connection token.\n\n🔗 Go to: https://spotix.com.ng/profile');
         }
       } catch (error) {
         console.error('Error connecting account:', error);
-        await sendMessage(cbChatId, '❌ Failed to connect account. Please try again.');
+        await sendMessage(cbChatId, '❌ Failed to connect account. Please try again.\n\n🔗 Go to: https://spotix.com.ng/profile');
       }
     }
     
     else if (data === 'cancel_connection') {
-      await sendMessage(cbChatId, '❌ Connection cancelled. You can try connecting again anytime from your Spotix profile.');
+      await sendMessage(cbChatId, '❌ Connection cancelled. You can try connecting again anytime from your Spotix profile.\n\n🔗 Go to: https://spotix.com.ng/profile');
+    }
+    
+    else if (data === 'confirm_disconnect') {
+      const user = await findUserByChatId(cbChatId);
+      
+      if (!user) {
+        await sendMessage(cbChatId, '❌ Your account is not connected.');
+        return reply.send({ status: 'ok' });
+      }
+      
+      try {
+        // Remove Telegram data from user document
+        await db.collection('users').doc(user.id).update({
+          telegramConnected: false,
+          telegramChatId: admin.firestore.FieldValue.delete(),
+          telegramUsername: admin.firestore.FieldValue.delete(),
+          telegramFirstName: admin.firestore.FieldValue.delete(),
+          telegramLastName: admin.firestore.FieldValue.delete(),
+          telegramConnectedAt: admin.firestore.FieldValue.delete()
+        });
+        
+        await sendMessage(cbChatId, `✅ *Disconnected Successfully*\n\nYour Telegram account has been disconnected from your Spotix profile.\n\nTo reconnect, visit your profile page and click "Connect Telegram Bot".`, {
+          inline_keyboard: [
+            [{ text: '🔗 Reconnect', url: 'https://spotix.com.ng/profile' }]
+          ]
+        });
+        
+        console.log(`🔌 Telegram account disconnected for user ${user.id}`);
+      } catch (error) {
+        console.error('Error disconnecting account:', error);
+        await sendMessage(cbChatId, '❌ Failed to disconnect account. Please try again.');
+      }
+    }
+    
+    else if (data === 'cancel_disconnect') {
+      await sendMessage(cbChatId, '✅ Disconnect cancelled. Your account remains connected.');
     }
     
     else if (data?.startsWith('qr_')) {
+      const user = await findUserByChatId(cbChatId);
+      
+      if (!user) {
+        await sendAuthRequiredMessage(cbChatId);
+        return reply.send({ status: 'ok' });
+      }
+
       const ticketId = data.split('qr_')[1];
 
       if (!ticketId || ticketId === 'Unavailable') {
@@ -313,11 +461,16 @@ Thank you for choosing *Spotix*! 💜`);
       await sendMessage(cbChatId, '🎨 Generating QR code...');
       const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(ticketId)}&size=300x300&color=107-47-165`;
 
-      await fetch(`${TELEGRAM_API}/sendPhoto`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chat_id: cbChatId, photo: qrUrl })
-      });
+      try {
+        await fetch(`${TELEGRAM_API}/sendPhoto`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: cbChatId, photo: qrUrl })
+        });
+      } catch (error) {
+        console.error('Error sending QR code:', error);
+        await sendMessage(cbChatId, '❌ Failed to generate QR code. Please try again.');
+      }
     }
   }
 
@@ -332,10 +485,8 @@ fastify.post('/paystack-webhook', async (request, reply) => {
     const { metadata, amount, reference, customer, paid_at } = data;
     const telegramChatId = metadata.telegramID;
 
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(telegramChatId)).get();
-    if (userSnap.empty) return reply.send({ received: true });
-
-    const userId = userSnap.docs[0].id;
+    const user = await findUserByChatId(telegramChatId);
+    if (!user) return reply.send({ received: true });
 
     const fundDoc = {
       amount: amount / 100,
@@ -344,9 +495,15 @@ fastify.post('/paystack-webhook', async (request, reply) => {
       reference,
     };
 
-    await db.collection('users').doc(userId).collection('fund').add(fundDoc);
-
-    console.log(`💰 Fund record saved for ${userId}`);
+    try {
+      await db.collection('users').doc(user.id).collection('fund').add(fundDoc);
+      console.log(`💰 Fund record saved for ${user.id}`);
+      
+      // Notify user of successful payment
+      await sendMessage(telegramChatId, `✅ *Payment Successful!*\n\n💰 Amount: ₦${fundDoc.amount}\n🆔 Reference: ${reference}\n📅 Date: ${fundDoc.date} ${fundDoc.time}\n\nYour wallet has been funded successfully!`);
+    } catch (error) {
+      console.error('Error saving fund record:', error);
+    }
 
     return reply.send({ received: true });
   }
@@ -370,7 +527,7 @@ fastify.post('/api/telegram/create-token', async (request, reply) => {
     const expiresAt = new Date(Date.now() + (10 * 60 * 1000)); // 10 minutes
     
     await db.collection('telegramTokens').doc(token).set({
-      uid: userId, // Changed to match your profile component
+      uid: userId,
       userEmail,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
       expiresAt,
@@ -401,6 +558,7 @@ fastify.get('/api/telegram/connection-status/:userId', async (request, reply) =>
       connected: userData.telegramConnected || false,
       telegramUsername: userData.telegramUsername || null,
       telegramFirstName: userData.telegramFirstName || null,
+      telegramLastName: userData.telegramLastName || null,
       telegramChatId: userData.telegramChatId || null,
       connectedAt: userData.telegramConnectedAt || null
     });
@@ -411,9 +569,6 @@ fastify.get('/api/telegram/connection-status/:userId', async (request, reply) =>
 });
 
 // === Ping Route for Cold Start Prevention ===
-// Track server start time for uptime monitoring
-const serverStartTime = Date.now();
-
 fastify.get('/ping', async (request, reply) => {
   const uptime = Math.floor((Date.now() - serverStartTime) / 1000);
   
@@ -476,11 +631,15 @@ async function sendMessage(chatId, text, replyMarkup) {
     reply_markup: replyMarkup
   };
 
-  await fetch(`${TELEGRAM_API}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload)
-  });
+  try {
+    await fetch(`${TELEGRAM_API}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (error) {
+    console.error('Error sending message:', error);
+  }
 }
 
 // === Start Server ===
