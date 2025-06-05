@@ -155,7 +155,7 @@ fastify.post('/webhook', async (request, reply) => {
         const cancelledChatId = param.split('cancelled_')[1];
         if (cancelledChatId === String(chatId)) {
           // Log the cancellation
-          await handleTransactionCancellation(chatId);
+          await handleTransactionCancellation(chatId, null, db, admin);
           await sendMessage(chatId, '❌ *Transaction Cancelled*\n\nYour wallet funding transaction was cancelled. No charges were made to your account.\n\nYou can try funding your wallet again using /fund command.');
           return reply.send({ status: 'ok' });
         }
@@ -672,7 +672,7 @@ fastify.post('/paystack-webhook', async (request, reply) => {
 
     try {
       // Process the wallet funding
-      const result = await processWalletFunding(data, telegramChatId);
+      const result = await processWalletFunding(data, telegramChatId, db, admin);
       
       if (result.success) {
         // Notify user of successful payment

@@ -1,5 +1,3 @@
-import admin from 'firebase-admin';
-import { collection, addDoc, doc, getDoc, updateDoc, serverTimestamp } from 'firebase/firestore';   
 import mailjet from 'node-mailjet';
 
 // Initialize Mailjet client
@@ -11,8 +9,6 @@ const mailjetClient = mailjet.apiConnect(
     options: {}
   }
 );
-
-const db = admin.firestore();
 
 // Generate transaction ID with the same pattern as wallet-fund component
 const generateTransactionId = () => {
@@ -101,7 +97,7 @@ export async function verifyTransaction(reference) {
 }
 
 // Process successful wallet funding
-export async function processWalletFunding(transactionData, telegramChatId) {
+export async function processWalletFunding(transactionData, telegramChatId, db, admin) {
   try {
     const { amount, reference, customer, paid_at, metadata } = transactionData;
     const fundAmount = amount / 100; // Convert from kobo to naira
@@ -200,7 +196,7 @@ export async function processWalletFunding(transactionData, telegramChatId) {
 }
 
 // Handle transaction cancellation
-export async function handleTransactionCancellation(telegramChatId, reference) {
+export async function handleTransactionCancellation(telegramChatId, reference, db, admin) {
   try {
     // Find user by telegram chat ID
     const telegramDoc = await db.collection('TelegramID').doc(String(telegramChatId)).get();
@@ -236,7 +232,7 @@ export async function handleTransactionCancellation(telegramChatId, reference) {
       message: 'Transaction cancellation logged'
     };
     
-  } catch (error) { 
+  } catch (error) {
     console.error('Error handling transaction cancellation:', error);
     return {
       success: false,
