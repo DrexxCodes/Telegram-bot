@@ -249,7 +249,7 @@ fastify.post('/webhook', async (request, reply) => {
       
       const userData = userDoc.data();
       
-      await sendMessage(chatId, '💾 Account successfully provisioned');
+      await sendMessage(chatId, '💾 Setting up your Telegram connection...');
       
       // Update user document with Telegram info
       await db.collection('users').doc(userId).update({
@@ -407,7 +407,7 @@ fastify.post('/webhook', async (request, reply) => {
     await sendMessage(cbChatId, '⏳ Please wait a moment...');
     
     try {
-      // First check TelegramID collection
+      // Find user by chat ID from TelegramID collection
       const telegramDoc = await db.collection('TelegramID').doc(String(cbChatId)).get();
       
       if (!telegramDoc.exists) {
@@ -420,7 +420,7 @@ fastify.post('/webhook', async (request, reply) => {
       
       await sendMessage(cbChatId, '📋 Fetching your profile details...');
       
-      // Get detailed user data from users collection using UID
+      // Cross-check with users collection using the UID
       const userDoc = await db.collection('users').doc(userId).get();
       
       if (!userDoc.exists) {
@@ -669,15 +669,42 @@ fastify.post('/paystack-webhook', async (request, reply) => {
     const telegramChatId = metadata.telegramID;
 
     try {
+      // First verify the transaction with Paystack
+      console.log(`🔍 Verifying transaction: ${reference}`);
+      const verificationResult = await verifyTransaction(reference);
+      
+      if (!verificationResult.success) {
+        console.error('❌ Transaction verification failed:', verificationResult.message);
+        await sendMessage(telegramChatId, '❌ *Payment Verification Failed*\n\nWe could not verify your payment. Please contact support with your transaction reference.\n\n📧 Support: support@spotix.com.ng');
+        return reply.send({ received: true });
+      }
+
+      console.log(`✅ Transaction verified successfully: ${reference}`);
+      
       // Process the wallet funding
       const result = await processWalletFunding(data, telegramChatId, db, admin);
       
       if (result.success) {
-        // Notify user of successful payment
+        // Notify user of successful payment with detailed wallet information
         const formattedAmount = result.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
-        const formattedBalance = result.newBalance.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        const formattedPreviousBalance = result.previousBalance.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        const formattedNewBalance = result.newBalance.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
         
-        await sendMessage(telegramChatId, `🎉 *Payment Successful!*\n\n💰 **Amount Funded:** ₦${formattedAmount}\n💳 **Transaction ID:** ${result.transactionId}\n💼 **New Wallet Balance:** ₦${formattedBalance}\n📧 **Confirmation Email:** Sent to ${result.userEmail}\n\nThank you for using Spotix! 💜`, {
+        await sendMessage(telegramChatId, `🎉 *Payment Successful!*
+
+💰 **Amount Funded:** ₦${formattedAmount}
+💳 **Transaction ID:** ${result.transactionId}
+
+💼 **Wallet Balance Update:**
+• Previous Balance: ₦${formattedPreviousBalance}
+• Amount Added: ₦${formattedAmount}
+• New Balance: ₦${formattedNewBalance}
+
+📧 **Confirmation Email:** Sent to ${result.userEmail}
+
+Your wallet has been successfully updated! 🎯
+
+Thank you for using Spotix! 💜`, {
           inline_keyboard: [
             [
               { text: '👤 View Profile', callback_data: 'show_profile' },
@@ -686,7 +713,13 @@ fastify.post('/paystack-webhook', async (request, reply) => {
           ]
         });
         
-        console.log(`💰 Wallet funding completed: ₦${result.amount}`);
+        console.log(`💰 Wallet funding completed successfully:
+- User: ${result.userFullName}
+- Amount: ₦${result.amount}
+- Previous Balance: ₦${result.previousBalance}
+- New Balance: ₦${result.newBalance}
+- Transaction ID: ${result.transactionId}
+- Wallet Updated: ${result.walletUpdated ? 'Yes' : 'No'}`);
       }
     } catch (error) {
       console.error('Error processing wallet funding:', error);

@@ -53,7 +53,7 @@ async function sendTransactionEmail(userEmail, userName, transactionData) {
       });
 
     const result = await request;
-    console.log('✅ Transaction email sent successfully:', result.body);
+    console.log('✅ Transaction email sent successfully');
     return true;
   } catch (error) {
     console.error('❌ Error sending transaction email:', error.statusCode || error.message);
@@ -131,19 +131,32 @@ export async function processWalletFunding(transactionData, telegramChatId, db, 
     });
     const transactionTime = now.toLocaleTimeString();
     
-    // Get current wallet balance
-    const currentWalletBalance = userData.wallet || 0;
+    // Get current wallet balance and ensure user still exists
+    const userDocRef = db.collection('users').doc(userId);
+    const currentUserDoc = await userDocRef.get();
+
+    if (!currentUserDoc.exists()) {
+      throw new Error('User no longer exists during wallet update');
+    }
+
+    const currentWalletBalance = currentUserDoc.data().wallet || 0;
     const newWalletBalance = currentWalletBalance + fundAmount;
-    
-    // Create wallet-pay entry
+
+    console.log(`💰 Wallet Update Details:
+- User ID: ${userId}
+- Current Balance: ₦${currentWalletBalance}
+- Fund Amount: ₦${fundAmount}
+- New Balance: ₦${newWalletBalance}`);
+
+    // Create wallet-pay entry following the exact pattern from wallet-fund component
     await db.collection('users').doc(userId).collection('wallet-pay').add({
       transactionId,
       transactionDate,
       transactionTime,
-      tx_name: "Wallet Funding",
+      transactionType: "Wallet Funding",
       amount: fundAmount,
       tag: "credit",
-      status: "Successful",
+      status: "completed",
       reference: reference,
       paystackReference: reference,
       telegramChatId: String(telegramChatId),
@@ -155,11 +168,34 @@ export async function processWalletFunding(transactionData, telegramChatId, db, 
       paymentMethod: "Paystack",
       source: "Telegram Bot"
     });
-    
-    // Update user's wallet balance
-    await db.collection('users').doc(userId).update({
-      wallet: newWalletBalance
+
+    console.log(`📝 Wallet-pay entry created successfully for transaction: ${transactionId}`);
+
+    // Update user's wallet balance in the users collection
+    await userDocRef.update({
+      wallet: newWalletBalance,
+      lastWalletUpdate: admin.firestore.FieldValue.serverTimestamp(),
+      lastTransactionId: transactionId
     });
+
+    console.log(`✅ User wallet balance updated successfully:
+- User: ${userData.fullName} (${userId})
+- Previous Balance: ₦${currentWalletBalance}
+- New Balance: ₦${newWalletBalance}
+- Transaction ID: ${transactionId}`);
+
+    // Verify the wallet update was successful
+    const verificationDoc = await userDocRef.get();
+    const updatedWallet = verificationDoc.data().wallet;
+
+    if (updatedWallet !== newWalletBalance) {
+      console.error(`❌ Wallet update verification failed!
+- Expected: ₦${newWalletBalance}
+- Actual: ₦${updatedWallet}`);
+      throw new Error('Wallet balance update verification failed');
+    }
+
+    console.log(`🔍 Wallet update verified successfully: ₦${updatedWallet}`);
     
     // Send transaction email
     try {
@@ -173,7 +209,6 @@ export async function processWalletFunding(transactionData, telegramChatId, db, 
           transactionDate: transactionDate
         }
       );
-      console.log(`📧 Transaction email sent to ${userData.email}`);
     } catch (emailError) {
       console.error('Email sending failed, but transaction was processed:', emailError);
     }
@@ -184,9 +219,11 @@ export async function processWalletFunding(transactionData, telegramChatId, db, 
       success: true,
       transactionId,
       amount: fundAmount,
+      previousBalance: currentWalletBalance,
       newBalance: newWalletBalance,
       userFullName: userData.fullName,
-      userEmail: userData.email
+      userEmail: userData.email,
+      walletUpdated: true
     };
     
   } catch (error) {
@@ -214,10 +251,10 @@ export async function handleTransactionCancellation(telegramChatId, reference, d
       transactionId: `cancelled-${Date.now()}`,
       transactionDate: new Date().toLocaleDateString(),
       transactionTime: new Date().toLocaleTimeString(),
-      tx_name: "Wallet Funding",
+      transactionType: "Wallet Funding",
       amount: 0,
       tag: "cancelled",
-      status: "Cancelled",
+      status: "cancelled", // Changed to match component pattern
       reference: reference || 'N/A',
       telegramChatId: String(telegramChatId),
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
