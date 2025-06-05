@@ -113,7 +113,6 @@ async function sendAccountLinkedEmail(userEmail, userName, telegramUsername) {
       });
 
     const result = await request;
-    console.log('✅ Account linked email sent successfully:', result.body);
     return true;
   } catch (error) {
     console.error('❌ Error sending account linked email:', error.statusCode || error.message);
@@ -134,6 +133,7 @@ fastify.post('/webhook', async (request, reply) => {
 
   // Handle /start command with payment status
   if (text?.startsWith('/start')) {
+    console.log(`Command: /start - User: ${chatId}`);
     const parts = text.split(' ');
     
     // Check if user is already connected
@@ -187,6 +187,7 @@ fastify.post('/webhook', async (request, reply) => {
   }
 
   else if (text === '/connect') {
+    console.log(`Command: /connect - User: ${chatId}`);
     // Check if user is already connected
     const existingUser = await findUserByChatId(chatId);
     
@@ -248,7 +249,7 @@ fastify.post('/webhook', async (request, reply) => {
       
       const userData = userDoc.data();
       
-      await sendMessage(chatId, '💾 Setting up your Telegram connection...');
+      await sendMessage(chatId, '💾 Account successfully provisioned');
       
       // Update user document with Telegram info
       await db.collection('users').doc(userId).update({
@@ -281,9 +282,7 @@ fastify.post('/webhook', async (request, reply) => {
           userData.fullName,
           username
         );
-        console.log(`📧 Account linked email sent to ${userData.email}`);
       } catch (emailError) {
-        console.error('Email sending failed, but connection was successful:', emailError);
         // Don't fail the connection process if email fails
       }
       
@@ -306,13 +305,7 @@ fastify.post('/webhook', async (request, reply) => {
         ]
       });
       
-      console.log(`✅ Telegram account connected for user ${userId}:`, {
-        telegramChatId: chatId,
-        telegramUsername: username,
-        fullName: userData.fullName,
-        email: userData.email,
-        isBooker: userData.isBooker
-      });
+      console.log(`✅ Account connected for user ${userId}`);
       
     } catch (error) {
       console.error('Error connecting account:', error);
@@ -321,7 +314,7 @@ fastify.post('/webhook', async (request, reply) => {
   }
 
   else if (text === '/viewTicket') {
-    await sendMessage(chatId, '⏳ Please wait a moment...');
+    console.log(`Command: /viewTicket - User: ${chatId}`);
     
     const user = await findUserByChatId(chatId);
     
@@ -369,6 +362,8 @@ fastify.post('/webhook', async (request, reply) => {
 
   else if (text === '/help' || callbackQuery?.data === 'show_commands') {
     const cbChatId = callbackQuery?.message?.chat?.id || chatId;
+    console.log(`Command: /help - User: ${cbChatId}`);
+    
     const user = await findUserByChatId(cbChatId);
     
     const commandButtons = [
@@ -407,6 +402,7 @@ fastify.post('/webhook', async (request, reply) => {
 
   else if (text === '/profile' || callbackQuery?.data === 'show_profile') {
     const cbChatId = callbackQuery?.message?.chat?.id || chatId;
+    console.log(`Command: /profile - User: ${cbChatId}`);
   
     await sendMessage(cbChatId, '⏳ Please wait a moment...');
     
@@ -460,22 +456,23 @@ fastify.post('/webhook', async (request, reply) => {
         inline_keyboard: [
           [
             { text: '🌐 View Full Profile', url: 'https://spotix.com.ng/profile' },
-          { text: '🎫 View Tickets', callback_data: 'cmd_viewTicket' }
-        ],
-        [
-          { text: '💰 Fund Wallet', callback_data: 'cmd_fund' },
-          { text: '🔌 Disconnect', callback_data: 'confirm_disconnect' }
+            { text: '🎫 View Tickets', callback_data: 'cmd_viewTicket' }
+          ],
+          [
+            { text: '💰 Fund Wallet', callback_data: 'cmd_fund' },
+            { text: '🔌 Disconnect', callback_data: 'confirm_disconnect' }
+          ]
         ]
-      ]
-    });
+      });
     
-  } catch (error) {
-    console.error('Error fetching profile:', error);
-    await sendMessage(cbChatId, '❌ Error fetching your profile. Please try again later.');
+    } catch (error) {
+      console.error('Error fetching profile:', error);
+      await sendMessage(cbChatId, '❌ Error fetching your profile. Please try again later.');
+    }
   }
-}
 
   else if (text === '/credits') {
+    console.log(`Command: /credits - User: ${chatId}`);
     await sendMessage(chatId, `🎖 *Spotix Bot Credits*:
 👨‍💻 Dev: Drexx
 🧪 Tester: David
@@ -486,6 +483,7 @@ Thank you for choosing *Spotix*! 💜`);
   }
 
   else if (text === '/fund') {
+    console.log(`Command: /fund - User: ${chatId}`);
     const user = await findUserByChatId(chatId);
     
     if (!user) {
@@ -498,6 +496,7 @@ Thank you for choosing *Spotix*! 💜`);
   }
 
   else if (text === '/disconnect') {
+    console.log(`Command: /disconnect - User: ${chatId}`);
     const user = await findUserByChatId(chatId);
     
     if (!user) {
@@ -566,6 +565,7 @@ Thank you for choosing *Spotix*! 💜`);
     // Handle command execution from help menu
     if (data?.startsWith('cmd_')) {
       const command = data.split('cmd_')[1];
+      console.log(`Callback Command: /${command} - User: ${cbChatId}`);
       
       // Simulate the command by creating a fake message object
       const fakeMessage = {
@@ -586,7 +586,7 @@ Thank you for choosing *Spotix*! 💜`);
     }
     
     else if (data === 'confirm_disconnect') {
-      await sendMessage(cbChatId, '⏳ Please wait a moment...');
+      console.log(`Action: disconnect - User: ${cbChatId}`);
       
       const user = await findUserByChatId(cbChatId);
       
@@ -617,7 +617,6 @@ Thank you for choosing *Spotix*! 💜`);
           ]
         });
         
-        console.log(`🔌 Telegram account disconnected for user ${user.id}, chatId: ${cbChatId}`);
       } catch (error) {
         console.error('Error disconnecting account:', error);
         await sendMessage(cbChatId, '❌ Failed to disconnect account. Please try again.');
@@ -643,7 +642,6 @@ Thank you for choosing *Spotix*! 💜`);
         return reply.send({ status: 'ok' });
       }
 
-      await sendMessage(cbChatId, '🎨 Generating QR code...');
       const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?data=${encodeURIComponent(ticketId)}&size=300x300&color=107-47-165`;
 
       try {
@@ -688,7 +686,7 @@ fastify.post('/paystack-webhook', async (request, reply) => {
           ]
         });
         
-        console.log(`💰 Wallet funding completed for ${result.userFullName}: ₦${result.amount}`);
+        console.log(`💰 Wallet funding completed: ₦${result.amount}`);
       }
     } catch (error) {
       console.error('Error processing wallet funding:', error);
@@ -763,6 +761,12 @@ fastify.get('/api/telegram/connection-status/:userId', async (request, reply) =>
 // === Ping Route for Cold Start Prevention ===
 fastify.get('/ping', async (request, reply) => {
   const uptime = Math.floor((Date.now() - serverStartTime) / 1000);
+  const userAgent = request.headers['user-agent'] || '';
+  
+  // Log when UptimeRobot pings the server
+  if (userAgent.includes('UptimeRobot')) {
+    console.log(`🤖 UptimeRobot ping received - Server uptime: ${uptime}s`);
+  }
   
   return reply.code(200).send({
     status: 'alive',
