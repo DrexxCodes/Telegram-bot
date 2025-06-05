@@ -1,6 +1,6 @@
 // fund.mjs
 
-export async function generatePaymentLink(email, amount, chatId) {
+export async function generatePaymentLink(email, amount, telegramChatId, userId) {
   try {
     const paystackSecretKey = process.env.PAYSTACK_SECRET_KEY;
 
@@ -13,8 +13,14 @@ export async function generatePaymentLink(email, amount, chatId) {
       body: JSON.stringify({
         email,
         amount: amount * 100, // Paystack expects amount in kobo
-        metadata: { telegramID: chatId },
-        callback_url: 'https://spotix.com.ng/payment-success',
+        metadata: { 
+          telegramID: telegramChatId,
+          userId: userId,
+          source: 'telegram_bot',
+          purpose: 'wallet_funding'
+        },
+        callback_url: `https://t.me/TristarAI_bot?start=payment_${telegramChatId}`,
+        cancel_url: `https://t.me/TristarAI_bot?start=cancelled_${telegramChatId}`,
       }),
     });
 

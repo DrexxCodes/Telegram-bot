@@ -4,6 +4,8 @@ import admin from 'firebase-admin';
 import cors from '@fastify/cors';
 import dotenv from 'dotenv';
 import { generatePaymentLink } from './fund.mjs'; 
+import { verifyTransaction, processWalletFunding, handleTransactionCancellation } from './verify.mjs';
+import mailjet from 'node-mailjet';
 
 dotenv.config();
 
@@ -23,6 +25,16 @@ admin.initializeApp({
 });
 const db = admin.firestore();
 
+// === Mailjet Setup ===
+const mailjetClient = mailjet.apiConnect(
+  process.env.MJ_APIKEY_PUBLIC,
+  process.env.MJ_APIKEY_PRIVATE,
+  {
+    config: {},
+    options: {}
+  }
+);
+
 // === Telegram Setup ===
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const TELEGRAM_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -33,11 +45,23 @@ const serverStartTime = Date.now(); // Track server start time for uptime monito
 // === Helper Functions ===
 async function findUserByChatId(chatId) {
   try {
-    const userSnap = await db.collection('users').where('telegramChatId', '==', String(chatId)).get();
-    if (userSnap.empty) return null;
+    // First check TelegramID collection
+    const telegramDoc = await db.collection('TelegramID').doc(String(chatId)).get();
+    
+    if (!telegramDoc.exists) return null;
+    
+    const telegramData = telegramDoc.data();
+    const userId = telegramData.uid;
+    
+    // Get full user data from users collection
+    const userDoc = await db.collection('users').doc(userId).get();
+    
+    if (!userDoc.exists) return null;
+    
     return {
-      id: userSnap.docs[0].id,
-      data: userSnap.docs[0].data()
+      id: userId,
+      data: userDoc.data(),
+      telegramData: telegramData
     };
   } catch (error) {
     console.error('Error finding user by chat ID:', error);
@@ -58,6 +82,45 @@ async function sendAuthRequiredMessage(chatId) {
   });
 }
 
+// === Email Helper Function ===
+async function sendAccountLinkedEmail(userEmail, userName, telegramUsername) {
+  try {
+    const request = mailjetClient
+      .post('send', { version: 'v3.1' })
+      .request({
+        Messages: [
+          {
+            From: {
+              Email: "support@spotix.com.ng",
+              Name: "Spotix Nigeria"
+            },
+            To: [
+              {
+                Email: userEmail,
+                Name: userName || "User"
+              }
+            ],
+            TemplateID: 7045593,
+            TemplateLanguage: true,
+            Subject: "Account Linked to Bot",
+            Variables: {
+              year: "2025",
+              telegram_user: telegramUsername ? `@${telegramUsername}` : "@unknown",
+              username: userName || "User"
+            }
+          }
+        ]
+      });
+
+    const result = await request;
+    console.log('✅ Account linked email sent successfully:', result.body);
+    return true;
+  } catch (error) {
+    console.error('❌ Error sending account linked email:', error.statusCode || error.message);
+    return false;
+  }
+}
+
 // === Webhook Handler ===
 fastify.post('/webhook', async (request, reply) => {
   const body = request.body;
@@ -69,10 +132,35 @@ fastify.post('/webhook', async (request, reply) => {
   const firstName = message?.from?.first_name;
   const lastName = message?.from?.last_name;
 
-  // Handle /start command
+  // Handle /start command with payment status
   if (text?.startsWith('/start')) {
+    const parts = text.split(' ');
+    
     // Check if user is already connected
     const existingUser = await findUserByChatId(chatId);
+    
+    // Handle payment success/cancellation
+    if (parts.length > 1) {
+      const param = parts[1];
+      
+      if (param.startsWith('payment_')) {
+        const paymentChatId = param.split('payment_')[1];
+        if (paymentChatId === String(chatId)) {
+          await sendMessage(chatId, '🎉 *Payment Successful!*\n\nYour wallet funding transaction has been completed successfully. Your wallet balance has been updated.\n\nUse /profile to check your updated balance.');
+          return reply.send({ status: 'ok' });
+        }
+      }
+      
+      if (param.startsWith('cancelled_')) {
+        const cancelledChatId = param.split('cancelled_')[1];
+        if (cancelledChatId === String(chatId)) {
+          // Log the cancellation
+          await handleTransactionCancellation(chatId);
+          await sendMessage(chatId, '❌ *Transaction Cancelled*\n\nYour wallet funding transaction was cancelled. No charges were made to your account.\n\nYou can try funding your wallet again using /fund command.');
+          return reply.send({ status: 'ok' });
+        }
+      }
+    }
     
     if (existingUser) {
       await sendMessage(chatId, `👋 Welcome back, ${existingUser.data.fullName || 'User'}!\n\nYour Telegram account is already connected to your Spotix profile.\n\nUse /help to see available commands.`, {
@@ -120,6 +208,8 @@ fastify.post('/webhook', async (request, reply) => {
       return reply.send({ status: 'ok' });
     }
 
+    await sendMessage(chatId, '🔄 Verifying connection token...');
+
     try {
       const tokenDoc = await db.collection('telegramTokens').doc(connectionToken).get();
       
@@ -147,6 +237,8 @@ fastify.post('/webhook', async (request, reply) => {
 
       const userId = tokenData.uid;
       
+      await sendMessage(chatId, '📋 Fetching your account details...');
+      
       // Get user details from users collection
       const userDoc = await db.collection('users').doc(userId).get();
       if (!userDoc.exists) {
@@ -155,6 +247,8 @@ fastify.post('/webhook', async (request, reply) => {
       }
       
       const userData = userDoc.data();
+      
+      await sendMessage(chatId, '💾 Setting up your Telegram connection...');
       
       // Update user document with Telegram info
       await db.collection('users').doc(userId).update({
@@ -166,6 +260,33 @@ fastify.post('/webhook', async (request, reply) => {
         telegramConnectedAt: admin.firestore.FieldValue.serverTimestamp()
       });
       
+      // Create TelegramID collection entry
+      await db.collection('TelegramID').doc(String(chatId)).set({
+        uid: userId,
+        fullName: userData.fullName || '',
+        email: userData.email || '',
+        isBooker: userData.isBooker || false,
+        telegramUsername: username || '',
+        telegramFirstName: firstName || '',
+        telegramLastName: lastName || '',
+        chatId: String(chatId),
+        joinedDate: admin.firestore.FieldValue.serverTimestamp(),
+        connectedAt: admin.firestore.FieldValue.serverTimestamp()
+      });
+      
+      // Send account linked email notification
+      try {
+        await sendAccountLinkedEmail(
+          userData.email,
+          userData.fullName,
+          username
+        );
+        console.log(`📧 Account linked email sent to ${userData.email}`);
+      } catch (emailError) {
+        console.error('Email sending failed, but connection was successful:', emailError);
+        // Don't fail the connection process if email fails
+      }
+      
       // Mark token as used
       await db.collection('telegramTokens').doc(connectionToken).update({
         used: true,
@@ -176,7 +297,7 @@ fastify.post('/webhook', async (request, reply) => {
         telegramLastName: lastName || ''
       });
       
-      await sendMessage(chatId, `🎉 *Connection Successful!*\n\nYour Telegram account has been successfully connected to your Spotix profile.\n\n✅ **Account Details:**\n👤 Name: ${userData.fullName || 'Not set'}\n📧 Email: ${userData.email}\n💬 Telegram: @${username || 'Not set'}\n\nYou can now use all bot features! Try /profile to see your account details.`, {
+      await sendMessage(chatId, `🎉 *Connection Successful!*\n\n✅ **Welcome, ${userData.fullName || 'User'}!**\n\nYour Telegram account has been successfully connected to your Spotix profile.\n\n👤 **Account Details:**\n• Name: ${userData.fullName || 'Not set'}\n• Email: ${userData.email}\n• Account Type: ${userData.isBooker ? 'Booker' : 'User'}\n• Telegram: @${username || 'Not set'}\n\nYou can now use all bot features! Try /profile to see your complete account details.`, {
         inline_keyboard: [
           [
             { text: '👤 View Profile', callback_data: 'show_profile' },
@@ -188,8 +309,9 @@ fastify.post('/webhook', async (request, reply) => {
       console.log(`✅ Telegram account connected for user ${userId}:`, {
         telegramChatId: chatId,
         telegramUsername: username,
-        telegramFirstName: firstName,
-        telegramLastName: lastName
+        fullName: userData.fullName,
+        email: userData.email,
+        isBooker: userData.isBooker
       });
       
     } catch (error) {
@@ -199,6 +321,8 @@ fastify.post('/webhook', async (request, reply) => {
   }
 
   else if (text === '/viewTicket') {
+    await sendMessage(chatId, '⏳ Please wait a moment...');
+    
     const user = await findUserByChatId(chatId);
     
     if (!user) {
@@ -206,7 +330,7 @@ fastify.post('/webhook', async (request, reply) => {
       return reply.send({ status: 'ok' });
     }
 
-    await sendMessage(chatId, '⏳ Just a moment...');
+    await sendMessage(chatId, '🎫 Fetching your tickets...');
     
     try {
       const ticketsSnap = await db.collection(`TicketHistory/${user.id}/tickets`).get();
@@ -219,6 +343,8 @@ fastify.post('/webhook', async (request, reply) => {
         });
         return reply.send({ status: 'ok' });
       }
+
+      await sendMessage(chatId, `📋 Found ${ticketsSnap.docs.length} ticket(s). Loading details...`);
 
       for (const doc of ticketsSnap.docs) {
         const ticket = doc.data();
@@ -281,32 +407,73 @@ fastify.post('/webhook', async (request, reply) => {
 
   else if (text === '/profile' || callbackQuery?.data === 'show_profile') {
     const cbChatId = callbackQuery?.message?.chat?.id || chatId;
-    const user = await findUserByChatId(cbChatId);
+  
+    await sendMessage(cbChatId, '⏳ Please wait a moment...');
     
-    if (!user) {
-      await sendAuthRequiredMessage(cbChatId);
-      return reply.send({ status: 'ok' });
-    }
-
-    await sendMessage(cbChatId, '🔍 Just a moment...');
-    
-    const profileText = `👤 *Profile Details:*
-🧑 Full Name: ${user.data.fullName || 'N/A'}
-📧 Email: ${user.data.email || 'N/A'}
-💬 Telegram: @${user.data.telegramUsername || 'N/A'}
-||🆔 UID: ${user.id}||
-
-Thank you for choosing *Spotix*! 💜`;
-    
-    await sendMessage(cbChatId, profileText, {
-      inline_keyboard: [
+    try {
+      // First check TelegramID collection
+      const telegramDoc = await db.collection('TelegramID').doc(String(cbChatId)).get();
+      
+      if (!telegramDoc.exists) {
+        await sendAuthRequiredMessage(cbChatId);
+        return reply.send({ status: 'ok' });
+      }
+      
+      const telegramData = telegramDoc.data();
+      const userId = telegramData.uid;
+      
+      await sendMessage(cbChatId, '📋 Fetching your profile details...');
+      
+      // Get detailed user data from users collection using UID
+      const userDoc = await db.collection('users').doc(userId).get();
+      
+      if (!userDoc.exists) {
+        await sendMessage(cbChatId, '❌ User profile not found. Please try reconnecting your account.');
+        return reply.send({ status: 'ok' });
+      }
+      
+      const userData = userDoc.data();
+      
+      // Format joined date
+      const joinedDate = telegramData.joinedDate ? 
+        telegramData.joinedDate.toDate().toLocaleDateString('en-US', {
+          year: 'numeric',
+          month: 'long',
+          day: 'numeric'
+        }) : 'Unknown';
+      
+      // Format wallet balance
+      const walletBalance = userData.wallet || 0;
+      const formattedBalance = walletBalance.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+      
+      const profileText = `👤 *Your Spotix Profile*\n\n` +
+        `🧑 **Name:** ${userData.fullName || 'Not set'}\n` +
+        `📧 **Email:** ${userData.email || 'Not set'}\n` +
+        `👑 **Account Type:** ${userData.isBooker ? 'Booker' : 'User'}\n` +
+        `💰 **Wallet Balance:** ₦${formattedBalance}\n` +
+        `💬 **Telegram:** @${telegramData.telegramUsername || 'Not set'}\n` +
+        `📅 **Joined:** ${joinedDate}\n` +
+        `||🆔 **UID:** ${userId}||\n\n` +
+        `Thank you for choosing *Spotix*! 💜`;
+      
+      await sendMessage(cbChatId, profileText, {
+        inline_keyboard: [
+          [
+            { text: '🌐 View Full Profile', url: 'https://spotix.com.ng/profile' },
+          { text: '🎫 View Tickets', callback_data: 'cmd_viewTicket' }
+        ],
         [
-          { text: '🌐 View Full Profile', url: 'https://spotix.com.ng/profile' },
+          { text: '💰 Fund Wallet', callback_data: 'cmd_fund' },
           { text: '🔌 Disconnect', callback_data: 'confirm_disconnect' }
         ]
       ]
     });
+    
+  } catch (error) {
+    console.error('Error fetching profile:', error);
+    await sendMessage(cbChatId, '❌ Error fetching your profile. Please try again later.');
   }
+}
 
   else if (text === '/credits') {
     await sendMessage(chatId, `🎖 *Spotix Bot Credits*:
@@ -369,11 +536,17 @@ Thank you for choosing *Spotix*! 💜`);
     await sendMessage(chatId, '🔎 Generating your payment link...');
 
     try {
-      const paymentLink = await generatePaymentLink(user.data.email, amount, chatId);
+      const paymentLink = await generatePaymentLink(user.data.email, amount, chatId, user.id);
       if (!paymentLink) {
         await sendMessage(chatId, '❌ Failed to create payment link. Try again later.');
       } else {
-        await sendMessage(chatId, `✅ Please complete your payment:\n\n${paymentLink}`);
+        await sendMessage(chatId, `✅ *Payment Link Generated*\n\n💰 Amount: ₦${amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')}\n\nClick the link below to complete your payment:\n\n${paymentLink}\n\n⚠️ *Note:* After payment, you'll be redirected back to this bot automatically.`, {
+          inline_keyboard: [
+            [
+              { text: '💳 Pay Now', url: paymentLink }
+            ]
+          ]
+        });
       }
     } catch (error) {
       console.error('Error generating payment link:', error);
@@ -413,6 +586,8 @@ Thank you for choosing *Spotix*! 💜`);
     }
     
     else if (data === 'confirm_disconnect') {
+      await sendMessage(cbChatId, '⏳ Please wait a moment...');
+      
       const user = await findUserByChatId(cbChatId);
       
       if (!user) {
@@ -421,6 +596,8 @@ Thank you for choosing *Spotix*! 💜`);
       }
       
       try {
+        await sendMessage(cbChatId, '🔄 Disconnecting your account...');
+        
         // Remove Telegram data from user document
         await db.collection('users').doc(user.id).update({
           telegramConnected: false,
@@ -431,13 +608,16 @@ Thank you for choosing *Spotix*! 💜`);
           telegramConnectedAt: admin.firestore.FieldValue.delete()
         });
         
+        // Remove from TelegramID collection
+        await db.collection('TelegramID').doc(String(cbChatId)).delete();
+        
         await sendMessage(cbChatId, `✅ *Disconnected Successfully*\n\nYour Telegram account has been disconnected from your Spotix profile.\n\nTo reconnect, visit your profile page and generate a new connection token.`, {
           inline_keyboard: [
             [{ text: '🔗 Reconnect', url: 'https://spotix.com.ng/profile' }]
           ]
         });
         
-        console.log(`🔌 Telegram account disconnected for user ${user.id}`);
+        console.log(`🔌 Telegram account disconnected for user ${user.id}, chatId: ${cbChatId}`);
       } catch (error) {
         console.error('Error disconnecting account:', error);
         await sendMessage(cbChatId, '❌ Failed to disconnect account. Please try again.');
@@ -482,7 +662,7 @@ Thank you for choosing *Spotix*! 💜`);
   reply.send({ status: 'ok' });
 });
 
-// === Fund Payment Webhook Handler ===
+// === Enhanced Fund Payment Webhook Handler ===
 fastify.post('/paystack-webhook', async (request, reply) => {
   const { event, data } = request.body;
 
@@ -490,24 +670,31 @@ fastify.post('/paystack-webhook', async (request, reply) => {
     const { metadata, amount, reference, customer, paid_at } = data;
     const telegramChatId = metadata.telegramID;
 
-    const user = await findUserByChatId(telegramChatId);
-    if (!user) return reply.send({ received: true });
-
-    const fundDoc = {
-      amount: amount / 100,
-      date: new Date(paid_at).toLocaleDateString(),
-      time: new Date(paid_at).toLocaleTimeString(),
-      reference,
-    };
-
     try {
-      await db.collection('users').doc(user.id).collection('fund').add(fundDoc);
-      console.log(`💰 Fund record saved for ${user.id}`);
+      // Process the wallet funding
+      const result = await processWalletFunding(data, telegramChatId);
       
-      // Notify user of successful payment
-      await sendMessage(telegramChatId, `✅ *Payment Successful!*\n\n💰 Amount: ₦${fundDoc.amount}\n🆔 Reference: ${reference}\n📅 Date: ${fundDoc.date} ${fundDoc.time}\n\nYour wallet has been funded successfully!`);
+      if (result.success) {
+        // Notify user of successful payment
+        const formattedAmount = result.amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        const formattedBalance = result.newBalance.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+        
+        await sendMessage(telegramChatId, `🎉 *Payment Successful!*\n\n💰 **Amount Funded:** ₦${formattedAmount}\n💳 **Transaction ID:** ${result.transactionId}\n💼 **New Wallet Balance:** ₦${formattedBalance}\n📧 **Confirmation Email:** Sent to ${result.userEmail}\n\nThank you for using Spotix! 💜`, {
+          inline_keyboard: [
+            [
+              { text: '👤 View Profile', callback_data: 'show_profile' },
+              { text: '🎫 Browse Events', url: 'https://spotix.com.ng' }
+            ]
+          ]
+        });
+        
+        console.log(`💰 Wallet funding completed for ${result.userFullName}: ₦${result.amount}`);
+      }
     } catch (error) {
-      console.error('Error saving fund record:', error);
+      console.error('Error processing wallet funding:', error);
+      
+      // Notify user of error
+      await sendMessage(telegramChatId, '❌ *Payment Processing Error*\n\nYour payment was received but there was an error updating your wallet. Please contact support with your transaction reference.\n\n📧 Support: support@spotix.com.ng');
     }
 
     return reply.send({ received: true });
